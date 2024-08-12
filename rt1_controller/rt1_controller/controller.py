@@ -82,7 +82,7 @@ commands = {
 #COMMAND TYPES
 #1. pick up coke
 #2. cupboard
-COMMAND_TYPE = 'black'
+COMMAND_TYPE = 'coke'
 COMMANDS = commands[COMMAND_TYPE]
 # COMMAND = "Open the cupboard door"
 WHEEL_SEPARATION = 0.3153
@@ -131,17 +131,18 @@ ACTUATOR_LIFT_UPPER_LIMIT = 1.2
 
 LIFT_HEIGHT = 1.2
 
-RT1_KEYS = ['head', 'head2', 'head3', 'gripper']
-
 RT1_ACTION_RECORD = {
-	key:{
+	'head0':{
 		'world_vector_x':[],
 		'world_vector_y':[],
 		'world_vector_z':[],
 		'world_vector_r':[],
 		'gripper_close':[],
+		'roll':[],
+		'pitch':[],
+		'yaw':[],
 		'terminate_episode':[]
-	} for key in RT1_KEYS
+	}
 }
 
 REAL_ACTION_RECORD = {
@@ -160,13 +161,14 @@ REAL_ACTION_RECORD = {
 
 def plot_rt1_actions():
 	print('saving rt1 actions')
-	fig, ax = plt.subplots(len(RT1_ACTION_RECORD['head']), figsize=(20, 50))
-	for idx, (key, value) in enumerate(RT1_ACTION_RECORD['head'].items()):
+	fig, ax = plt.subplots(len(RT1_ACTION_RECORD['head0']), figsize=(20, 50))
+	for idx, (key, value) in enumerate(RT1_ACTION_RECORD['head0'].items()):
 		ax[idx].plot(value)
 		for camera_key, value in RT1_ACTION_RECORD.items():
-			if camera_key == 'head':
-				next
-			ax[idx].plot(RT1_ACTION_RECORD[camera_key][key])
+			if camera_key == 'head0':
+				continue
+			else:	
+				ax[idx].plot(RT1_ACTION_RECORD[camera_key][key])
 		ax[idx].set_title(key)
 		ax[idx].legend(list(RT1_ACTION_RECORD.keys()))
 	plt.savefig(os.path.join(OUTPUT_DIR_FOR_RUN, f'rt1_actions.png'))
@@ -183,6 +185,7 @@ def plot_real_actions():
 	plt.savefig(os.path.join(OUTPUT_DIR_FOR_RUN, 'real_actions.png'))
 	plt.clf()
 	plt.cla()
+	
 def diff_drive_inv_kinematics(V:float,omega:float)->tuple:
 	#COPIED FROM STRETCH MUJOCO REPO
 	"""
@@ -233,12 +236,27 @@ def record_rt1_actions(rt1_action, camera='head'):
 
 	world_vector_r = np.sqrt(world_vector_x**2 + world_vector_y**2)
 	world_vector_theta = np.arctan2(world_vector_y, world_vector_x) + np.pi/2
+	if camera not in RT1_ACTION_RECORD.keys():
+		RT1_ACTION_RECORD[camera] = {
+			'world_vector_x':[],
+			'world_vector_y':[],
+			'world_vector_z':[],
+			'world_vector_r':[],
+			'gripper_close':[],
+			'roll':[],
+			'pitch':[],
+			'yaw':[],
+			'terminate_episode':[]
+		}
 
 	RT1_ACTION_RECORD[camera]['world_vector_x'].append(world_vector_x)
 	RT1_ACTION_RECORD[camera]['world_vector_y'].append(world_vector_y)
 	RT1_ACTION_RECORD[camera]['world_vector_z'].append(world_vector_z)
 	RT1_ACTION_RECORD[camera]['world_vector_r'].append(world_vector_r)
 	RT1_ACTION_RECORD[camera]['gripper_close'].append(gripper_closedness)
+	RT1_ACTION_RECORD[camera]['roll'].append(rt1_roll)
+	RT1_ACTION_RECORD[camera]['pitch'].append(rt1_pitch)
+	RT1_ACTION_RECORD[camera]['yaw'].append(rt1_yaw)
 	RT1_ACTION_RECORD[camera]['terminate_episode'].append(terminate_episode)
 
 def mix_rt1_action_outputs_from_multiple_inputs(rt1_actions):
@@ -275,6 +293,7 @@ def mix_real_action_outputs_from_multiple_inputs(real_actions):
 	# we are prioritizing the grippers decision when it comes to the control of gripper
 	mixed_real_actions['gripper_close'] = head_real_action['gripper_close']
 	
+	
 	return mixed_real_actions
 		
 
@@ -282,49 +301,48 @@ class RT1Node(Node):
 	def __init__(self):
 		super().__init__('rt1_controller')
 		model_path = '../rt_1_x_tf_trained_for_002272480_step'
-		tfa_policy = py_tf_eager_policy.SavedModelPyTFEagerPolicy(
-				model_path=model_path,
-				load_specs_from_pbtxt=True,
-				use_tf_function=True)
-		self.tfa_policy = tfa_policy
-		self.rt1_policy_state = tfa_policy.get_initial_state(batch_size=1)
-		self.rt1_observation = tf_agents.specs.zero_spec_nest(tf_agents.specs.from_spec(tfa_policy.time_step_spec.observation))
-		print('INITIALIZED RT1')
-		second_tfa_policy = py_tf_eager_policy.SavedModelPyTFEagerPolicy(
-				model_path=model_path,
-				load_specs_from_pbtxt=True,
-				use_tf_function=True)
+		self.head_rt1_num = 4
+		self.wrist_rt1_num = 2
 
-		self.second_tfa_policy = second_tfa_policy
-		self.second_rt1_policy_state = second_tfa_policy.get_initial_state(batch_size=1)
-		self.second_rt1_observation = tf_agents.specs.zero_spec_nest(tf_agents.specs.from_spec(second_tfa_policy.time_step_spec.observation))
-		print('INITIALIZED SECOND RT1')
-
-		third_tfa_policy = py_tf_eager_policy.SavedModelPyTFEagerPolicy(
-				model_path=model_path,
-				load_specs_from_pbtxt=True,
-				use_tf_function=True)
-
-		self.third_tfa_policy = third_tfa_policy
-		self.third_rt1_policy_state = third_tfa_policy.get_initial_state(batch_size=1)
-		self.third_rt1_observation = tf_agents.specs.zero_spec_nest(tf_agents.specs.from_spec(second_tfa_policy.time_step_spec.observation))
-		print('INITIALIZED THIRD RT1')
-		self.step_num = 0
 		self.camera_type = 'head'
 		# only one of below should be true
 		self.alternate_images = False
 		self.alternate_every_n_steps = 5
 		self.mix_multiple_inputs = True
-		if self.alternate_images or self.mix_multiple_inputs:
+		self.wrist_rt1_num = 2
+
+		self.rt1_head_tfa_policies = []
+		self.rt1_head_observations = []
+		self.rt1_head_policy_states = []
+
+		self.rt1_wrist_tfa_policies = []
+		self.rt1_wrist_observations = []
+		self.rt1_wrist_policy_states = []
+
+
+		for i in range(self.head_rt1_num):
 			tfa_policy = py_tf_eager_policy.SavedModelPyTFEagerPolicy(
 				model_path=model_path,
 				load_specs_from_pbtxt=True,
 				use_tf_function=True)
-			self.wrist_tfa_policy = tfa_policy
-			self.wrist_rt1_policy_state = tfa_policy.get_initial_state(batch_size=1)
-			self.wrist_rt1_observation = tf_agents.specs.zero_spec_nest(tf_agents.specs.from_spec(tfa_policy.time_step_spec.observation))
-			print('INITIALIZED GRIPPER RT1')
-		
+			self.rt1_head_tfa_policies.append(tfa_policy)
+			self.rt1_head_policy_states.append(tfa_policy.get_initial_state(batch_size=1))
+			self.rt1_head_observations.append(tf_agents.specs.zero_spec_nest(tf_agents.specs.from_spec(tfa_policy.time_step_spec.observation)))
+			print(f'INITIALIZED RT1 HEAD {i}')
+
+		if self.alternate_images or self.mix_multiple_inputs:
+			for i in range(self.wrist_rt1_num):
+				tfa_policy = py_tf_eager_policy.SavedModelPyTFEagerPolicy(
+					model_path=model_path,
+					load_specs_from_pbtxt=True,
+					use_tf_function=True)
+				self.rt1_wrist_tfa_policies.append(tfa_policy)
+				self.rt1_wrist_policy_states.append(tfa_policy.get_initial_state(batch_size=1))
+				self.rt1_wrist_observations.append(tf_agents.specs.zero_spec_nest(tf_agents.specs.from_spec(tfa_policy.time_step_spec.observation)))
+				print(f'INITIALIZED RT1 WRIST {i}')
+
+
+		self.step_num = 0
 
 		self.got_head_image = False
 		self.got_wrist_image = False
@@ -350,8 +368,6 @@ class RT1Node(Node):
 		self.twist_pub = self.create_publisher(Twist, '/stretch/cmd_vel', 1)
 		
 		self.trajectory_client = ActionClient(self, FollowJointTrajectory, '/stretch_controller/follow_joint_trajectory')
-		# timed callback
-		# self.timer = self.create_timer(4, self.timer_callback)
 
 
 		# states
@@ -366,7 +382,9 @@ class RT1Node(Node):
 			'camera_type':self.camera_type,
 			'alternate_images':self.alternate_images,
 			'alternate_every_n_steps':self.alternate_every_n_steps,
-			'mix_multiple_inputs': self.mix_multiple_inputs
+			'mix_multiple_inputs': self.mix_multiple_inputs,
+			'head_rt1_num':self.head_rt1_num,
+			'wrist_rt1_num':self.wrist_rt1_num
 		}
 		with open(os.path.join(OUTPUT_DIR_FOR_RUN, 'config.json'), 'w') as f:
 			json.dump(data, f)
@@ -436,6 +454,40 @@ class RT1Node(Node):
 			# 'gripper_close': float(gripper_closedness),
 			'is_terminal_episode':is_terminal_episode
 		}
+	
+	def average_real_action_outputs_from_multiple_inputs(self, real_actions):
+		number_of_real_actions = len(real_actions)
+		number_of_head_rt1 = self.head_rt1_num
+		head_real_actions = real_actions[:number_of_head_rt1]
+
+		average_real_action = {}
+		for real_action in real_actions:
+			for key, val in real_action.items():
+				if key not in average_real_action:
+					average_real_action[key] = val
+				else:
+					average_real_action[key] += val
+		for key in average_real_action.keys():
+			average_real_action[key] /= number_of_real_actions
+
+		average_head_real_actions = {}
+		for head_real_actions in head_real_actions:
+			for key, val in head_real_actions.items():
+				if key not in average_head_real_actions:
+					average_head_real_actions[key] = val
+				else:
+					average_head_real_actions[key] += val
+		for key in average_head_real_actions.keys():
+			average_head_real_actions[key] /= number_of_head_rt1
+
+		# we are prioritizing the grippers decision when it comes to the control of gripper
+		average_real_action['gripper_close'] = average_head_real_actions['gripper_close']
+		# we are also prioritizing the head y coordinate over the grippers
+		average_real_action['y'] = average_head_real_actions['y']
+		
+		
+		return average_real_action
+		
 
 	def main(self):
 		self.record_configs_for_run()
@@ -454,7 +506,6 @@ class RT1Node(Node):
 					print('----------------------------------')
 				
 				self.step_num += 1
-				self.rt1_observation['natural_language_embedding'] = command_embedding
 				# print('image shape', self.image_state.shape)
 				if self.mix_multiple_inputs:
 					images = [self.resized_image_state, self.resized_gripper_image_state]
@@ -467,62 +518,40 @@ class RT1Node(Node):
 						# save picture 
 						cv2.imwrite(os.path.join(pic_dir, f'{action_time_str}_{name}.png'), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
 						if name == 'head':
-							self.rt1_observation['image'] = image
-							tfa_time_step = ts.transition(self.rt1_observation, reward=np.zeros((), dtype=np.float32))
-							policy_step = self.tfa_policy.action(tfa_time_step, self.rt1_policy_state)
-							rt1_action = policy_step.action
-							print('head rt1 action')
-							print(rt1_action)
-							self.rt1_policy_state = policy_step.state
-							record_rt1_actions(rt1_action, 'head')
-							real_action = self.translate_rt1_action_to_real_actions(rt1_action)
-							real_actions.append(real_action)
-							rt1_actions.append(rt1_action)
-
-
-							self.second_rt1_observation['image'] = image
-							tfa_time_step = ts.transition(self.second_rt1_observation, reward=np.zeros((), dtype=np.float32))
-							policy_step = self.second_tfa_policy.action(tfa_time_step, self.second_rt1_policy_state)
-							rt1_action = policy_step.action
-							print('head rt1 action')
-							print(rt1_action)
-							self.second_rt1_policy_state = policy_step.state		
-							record_rt1_actions(rt1_action, 'head2')			
-							real_action = self.translate_rt1_action_to_real_actions(rt1_action)
-							real_actions.append(real_action)
-							rt1_actions.append(rt1_action)
-							
-							self.third_rt1_observation['image'] = image
-							tfa_time_step = ts.transition(self.third_rt1_observation, reward=np.zeros((), dtype=np.float32))
-							policy_step = self.third_tfa_policy.action(tfa_time_step, self.third_rt1_policy_state)
-							rt1_action = policy_step.action
-							print('head rt1 action')
-							print(rt1_action)
-							self.third_rt1_policy_state = policy_step.state		
-							record_rt1_actions(rt1_action, 'head3')			
-							real_action = self.translate_rt1_action_to_real_actions(rt1_action)
-							real_actions.append(real_action)
-							rt1_actions.append(rt1_action)
+							for i in range(self.head_rt1_num):
+								self.rt1_head_observations[i]['image'] = image
+								self.rt1_head_observations[i]['natural_language_embedding'] = command_embedding
+								tfa_time_step = ts.transition(self.rt1_head_observations[i], reward=np.zeros((), dtype=np.float32))
+								policy_step = self.rt1_head_tfa_policies[i].action(tfa_time_step, self.rt1_head_policy_states[i])
+								rt1_action = policy_step.action
+								self.rt1_head_policy_states[i] = policy_step.state
+								print('head rt1 action')
+								print(rt1_action)
+								record_rt1_actions(rt1_action, f'head{i}')
+								real_action = self.translate_rt1_action_to_real_actions(rt1_action)
+								real_actions.append(real_action)
+								rt1_actions.append(rt1_action)
 
 						elif name == 'gripper':
-							self.wrist_rt1_observation['image'] = image
-							tfa_time_step = ts.transition(self.wrist_rt1_observation, reward=np.zeros((), dtype=np.float32))
-							policy_step = self.wrist_tfa_policy.action(tfa_time_step, self.wrist_rt1_policy_state)
-							rt1_action = policy_step.action
-							self.wrist_rt1_policy_state = policy_step.state
-							print('gripper rt1 action')
-							print(rt1_action)
-							record_rt1_actions(rt1_action, 'gripper')
-							real_action = self.translate_rt1_action_to_real_actions(rt1_action)
-							real_actions.append(real_action)
-							rt1_actions.append(rt1_action)
+							for i in range(self.wrist_rt1_num):
+								self.rt1_wrist_observations[i]['image'] = image
+								self.rt1_wrist_observations[i]['natural_language_embedding'] = command_embedding
+								tfa_time_step = ts.transition(self.rt1_wrist_observations[i], reward=np.zeros((), dtype=np.float32))
+								policy_step = self.rt1_wrist_tfa_policies[i].action(tfa_time_step, self.rt1_wrist_policy_states[i])
+								rt1_action = policy_step.action
+								self.rt1_wrist_policy_states[i] = policy_step.state
+								record_rt1_actions(rt1_action, f'gripper{i}')
+								real_action = self.translate_rt1_action_to_real_actions(rt1_action)
+								real_actions.append(real_action)
+								rt1_actions.append(rt1_action)
+						
 						else:
 							raise ValueError('Unknown image name')
 						
 						
 					# mixed_rt1_action = mix_rt1_action_outputs_from_multiple_inputs(rt1_actions)
 					# record_rt1_actions(mixed_rt1_action)
-					real_action = mix_real_action_outputs_from_multiple_inputs(real_actions)
+					real_action = self.average_real_action_outputs_from_multiple_inputs(real_actions)
 					record_real_actions(real_action)
 
 				else:
@@ -594,7 +623,8 @@ class RT1Node(Node):
 				extension_value = self.joint_state.position[extension_idx]
 
 				lift_height_remain = LIFT_HEIGHT - lift_value
-				angle = np.arctan2(extension_value + 0.5, lift_height_remain)
+				angle = np.arctan2(real_action['extension'] + 0.5, lift_height_remain)
+				print("ANGLE", angle)
 				 
 
 				head_pan_pos = -np.pi/2
