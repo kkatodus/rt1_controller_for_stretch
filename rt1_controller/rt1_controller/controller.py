@@ -18,17 +18,10 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from sensor_msgs.msg import JointState
 import sys
 import tensorflow as tf
-# import tensorflow_datasets as tfds
-# import rlds
-# from PIL import Image
 import numpy as np
 from tf_agents.policies import py_tf_eager_policy
 from tf_agents.trajectories import time_step as ts
 import tf_agents
-# from tf_agents.trajectories import time_step as ts
-# from IPython import display
-# from collections import defaultdict
-# import matplotlib.pyplot as plt
 import tensorflow_hub as hub
 from cv_bridge import CvBridge
 import cv2
@@ -36,6 +29,11 @@ from skimage.transform import resize
 from datetime import datetime
 import matplotlib.pyplot as plt
 import json
+import torch
+from transformers import ViTImageProcessor, ViTModel
+from PIL import Image as PILImage
+
+
 
 #fix seeds
 np.random.seed(0)
@@ -53,7 +51,12 @@ commands = {
 		"Collect the Coke can sitting on the table.",
 		"Lift the Coke can off the table.",
 		"Pick up the can of coke on the table",
-		"Lift the can of coke off the table"
+		"Lift the can of coke off the table",
+		"Retrieve the Coke can from the table.",
+		"Snatch the can of Coke from the table.",
+		"Fetch the Coke can placed on the table.",
+		"Remove the Coke can from the table.",
+		"Gather the can of Coke from the table.",
 	],
 	'yellow':[
 		"Pick up the yellow bottle can on the table",
@@ -137,7 +140,8 @@ REAL_ACTION_RECORD = {
 	'yaw':[],
 	'roll':[],
 	'gripper_close':[],
-	'is_terminal_episode':[]
+	'is_terminal_episode':[],
+	'gripper_image_similarity':[]
 
 }
 
@@ -150,40 +154,28 @@ def plot_rt1_actions():
 			if camera_key == 'head0':
 				continue
 			else:	
-				ax[idx].plot(RT1_ACTION_RECORD[camera_key][key], marker='o', ms=size*1.5, alpha=0.5)
+				ax[idx].plot(RT1_ACTION_RECORD[camera_key][key], marker='o', ms=size*1.1, alpha=0.5)
 		ax[idx].set_title(key)
 		ax[idx].legend(list(RT1_ACTION_RECORD.keys()))
 	plt.savefig(os.path.join(OUTPUT_DIR_FOR_RUN, f'rt1_actions.png'))
-	fig.clf()
 	plt.clf()
 	plt.cla()
+	plt.close()
 
 def plot_real_actions():
 	print('saving real actions')
-	fig, ax = plt.subplots(len(REAL_ACTION_RECORD), figsize=(20, 50))
+	fig, ax = plt.subplots(len(list(REAL_ACTION_RECORD.keys())), figsize=(20, 50))
 	for idx, (key, value) in enumerate(REAL_ACTION_RECORD.items()):
 		ax[idx].plot(value)
 		ax[idx].set_title(key)
 	plt.savefig(os.path.join(OUTPUT_DIR_FOR_RUN, 'real_actions.png'))
+	fig.clf()
 	plt.clf()
 	plt.cla()
-	
-def diff_drive_inv_kinematics(V:float,omega:float)->tuple:
-	#COPIED FROM STRETCH MUJOCO REPO
-	"""
-	Calculate the rotational velocities of the left and right wheels for a differential drive robot."""
-	R =WHEEL_DIAMETER/ 2
-	L = WHEEL_SEPARATION
-	if R <= 0:
-		raise ValueError("Radius must be greater than zero.")
-	if L <= 0:
-		raise ValueError("Distance between wheels must be greater than zero.")
-	
-	# Calculate the rotational velocities of the wheels
-	w_left = (V - (omega * L / 2)) / R
-	w_right = (V + (omega * L / 2)) / R
+	plt.close()
 
-	return (w_left, w_right)
+def cos_sim(vec1, vec2):
+	return (vec1@vec2)/(torch.norm(vec1)*torch.norm(vec2))
 
 def record_real_actions(real_action):
 	REAL_ACTION_RECORD['x'].append(real_action['x'])
@@ -204,7 +196,7 @@ def record_rt1_actions(rt1_action, camera='head'):
 	omega = np.arctan2(base_displacement_vector_y, base_displacement_vector_x)
 
 	base_rotation = rt1_action['base_displacement_vertical_rotation']
-	gripper_closedness = rt1_action['gripper_closedness_action']
+	gripper_closedness = rt1_action['gripper_closedness_action'][0]
 	rotation_delta = rt1_action['rotation_delta']
 	rt1_roll = rotation_delta[0]
 	rt1_pitch = rotation_delta[1]
@@ -252,7 +244,6 @@ def mix_rt1_action_outputs_from_multiple_inputs(rt1_actions):
 				mixed_rt1_actions[key] = val
 			else:
 				mixed_rt1_actions[key] += val
-	print(mixed_rt1_actions)
 	for key in mixed_rt1_actions.keys():
 		mixed_rt1_actions[key] = mixed_rt1_actions[key] / number_of_rt1_actions
 	return mixed_rt1_actions
@@ -262,6 +253,7 @@ class RT1Node(Node):
 	def __init__(self):
 		super().__init__('rt1_controller')
 		self.step_num = 0
+		self.grasped_at_step = None
 
 		self.got_head_image = False
 		self.got_wrist_image = False
@@ -280,8 +272,8 @@ class RT1Node(Node):
 
 		# subscribers
 		self.sound_direction_sub = self.create_subscription(Int32, "/sound_direction", self.callback_direction, 1)
-		self.image_sub = self.create_subscription(Image, '/camera/color/image_raw', self.image_callback, 1)
 		self.gripper_image_sub = self.create_subscription(Image, '/gripper_camera/color/image_rect_raw', self.wrist_image_callback, 1)
+		self.image_sub = self.create_subscription(Image, '/camera/color/image_raw', self.image_callback, 1)
 		self.target_point_publisher = self.create_publisher(PointStamped, "/clicked_point", 1)
 		# cmd vel publisher
 		self.twist_pub = self.create_publisher(Twist, '/stretch/cmd_vel', 1)
@@ -301,11 +293,29 @@ class RT1Node(Node):
 		self.command_embeddings = self.universal_sentence_encoder(COMMANDS)
 		average_command_embedding = np.mean(self.command_embeddings, axis=0)
 		self.average_command_embedding = np.expand_dims(average_command_embedding, axis=0)
+		self.diversify_command_embeddings = True
+
+		
+		self.image_processor = ViTImageProcessor.from_pretrained('google/vit-base-patch16-224-in21k')
+		self.image_encoder = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
+		gripper_sample_images_dir = '../grabbing_samples'
+		sample_image_filenames = os.listdir(gripper_sample_images_dir)
+		paths = [os.path.join(gripper_sample_images_dir, filename) for filename in sample_image_filenames]
+		images = [PILImage.open(path) for path in paths]
+		inputs = self.image_processor(images=images, return_tensors="pt")
+		outputs = self.image_encoder(**inputs)
+		last_hidden_states = outputs.last_hidden_state
+		print(last_hidden_states.shape)
+		self.average_sample_images_embedding = torch.mean(torch.mean(last_hidden_states, dim=1), dim=0)
+
+		print("INITIALIZED IMAGE ENCODER")
 
 
 		model_path = '../rt_1_x_tf_trained_for_002272480_step'
-		self.head_rt1_num = 6
-		self.wrist_rt1_num = 4
+		self.head_rt1_num = 7
+		self.wrist_rt1_num = 0
+		self.rt1_gripper_number_threshold = 1
+		self.has_grabbed = False
 
 		self.rt1_head_tfa_policies = []
 		self.rt1_head_observations = []
@@ -340,12 +350,20 @@ class RT1Node(Node):
 			self.rt1_wrist_policy_states.append(tfa_policy.get_initial_state(batch_size=1))
 			self.rt1_wrist_observations.append(tf_agents.specs.zero_spec_nest(tf_agents.specs.from_spec(tfa_policy.time_step_spec.observation)))
 			print(f'INITIALIZED RT1 WRIST {i}')
-
+		
+		continue_task = False
+		while not continue_task:
+			answer = input('All RT1s are initialized. Should we continue with the task?(yes/no)')
+			if answer == 'yes':
+				continue_task = True
+			time.sleep(2)
 	def record_configs_for_run(self):
 		data = {
 			'mixing_multiple_inputs':'Now we are always mixing multiple inputs',
 			'head_rt1_num':self.head_rt1_num,
-			'wrist_rt1_num':self.wrist_rt1_num
+			'wrist_rt1_num':self.wrist_rt1_num,
+			'diversify_command_embeddings':self.diversify_command_embeddings,
+			'gripper_threshold':self.rt1_gripper_number_threshold
 		}
 		with open(os.path.join(OUTPUT_DIR_FOR_RUN, 'config.json'), 'w') as f:
 			json.dump(data, f)
@@ -377,14 +395,9 @@ class RT1Node(Node):
 		base_displacement_vector_y = base_displacement_vector[1]
 		omega = np.arctan2(base_displacement_vector_y, base_displacement_vector_x)
 
-		rotation_delta = rt1_action['rotation_delta']
-		rt1_roll = rotation_delta[0]
-		rt1_pitch = rotation_delta[1]
-		rt1_yaw = rotation_delta[2]
-
 
 		base_rotation = rt1_action['base_displacement_vertical_rotation']
-		gripper_closedness = rt1_action['gripper_closedness_action']
+		gripper_closedness = rt1_action['gripper_closedness_action'][0]
 		rotation_delta = rt1_action['rotation_delta']
 		rt1_roll = rotation_delta[0]
 		rt1_pitch = rotation_delta[1]
@@ -404,20 +417,46 @@ class RT1Node(Node):
 		return {
 			'x':world_vector_x,
 			'y':world_vector_y,
-			'extension': world_vector_x+0.15,
+			'extension': world_vector_x+0.19,
 			'z':float((world_vector_z- RT1_LOWER_LIMIT) / (RT1_UPPER_LIMIT - RT1_LOWER_LIMIT))*(ACTUATOR_LIFT_UPPER_LIMIT - ACTUATOR_LIFT_LOWER_LIMIT) + ACTUATOR_LIFT_LOWER_LIMIT + 0.05,
 			'r':float(world_vector_r + 0.2),
 			'theta':world_vector_theta,
-			'pitch': rt1_pitch,
-			'yaw': rt1_yaw,
-			'roll': rt1_roll,
+			'pitch': 0.0,
+			'yaw': 0.0,
+			'roll': 0.0,
 			'gripper_close': ACTUATOR_GRIPPER_UPPER_LIMIT_OPEN-((gripper_closedness-RT1_GRIPPER_LOWER_LIMIT_OPEN)/(RT1_GRIPPER_UPPER_LIMIT_CLOSED-RT1_GRIPPER_LOWER_LIMIT_OPEN))*(ACTUATOR_GRIPPER_UPPER_LIMIT_OPEN-ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED),
 			# 'gripper_close':float(gripper_closedness)*-1,
 			# 'gripper_close': 1.0,
 			'is_terminal_episode':is_terminal_episode
 		}
 	
+	def get_image_embedding(self, image):
+		inputs = self.image_processor(image, return_tensors='pt')
+		outputs = self.image_encoder(**inputs)
+		last_hidden_states = outputs.last_hidden_state
+		return torch.mean(last_hidden_states, dim=1)
+
 	def average_real_action_outputs_from_multiple_inputs(self, real_actions):
+		head_pan_idx = self.joint_state.name.index('joint_head_pan')
+		head_tilt_idx = self.joint_state.name.index('joint_head_tilt')
+		wrist_yaw_idx = self.joint_state.name.index('joint_wrist_yaw')
+		wrist_pitch_idx = self.joint_state.name.index('joint_wrist_pitch')
+		wrist_roll_idx = self.joint_state.name.index('joint_wrist_roll')
+		gripper_left_idx = self.joint_state.name.index('joint_gripper_finger_left')
+		gripper_right_idx = self.joint_state.name.index('joint_gripper_finger_right')
+		lift_idx = self.joint_state.name.index('joint_lift')
+		extension_idx = self.joint_state.name.index('wrist_extension')
+
+		prev_head_pan_value = self.joint_state.position[head_pan_idx]
+		prev_head_tilt_value = self.joint_state.position[head_tilt_idx]
+		prev_wrist_yaw_value = self.joint_state.position[wrist_yaw_idx]
+		prev_wrist_pitch_value = self.joint_state.position[wrist_pitch_idx]
+		prev_wrist_roll_value = self.joint_state.position[wrist_roll_idx]
+		prev_gripper_left_value = self.joint_state.position[gripper_left_idx]
+		prev_gripper_right_value = self.joint_state.position[gripper_right_idx]
+		prev_lift_value = self.joint_state.position[lift_idx]
+		prev_extension_value = self.joint_state.position[extension_idx]
+
 		number_of_real_actions = len(real_actions)
 		number_of_head_rt1 = self.head_rt1_num
 		head_real_actions = real_actions[:number_of_head_rt1]
@@ -443,24 +482,83 @@ class RT1Node(Node):
 		for key in average_head_real_actions.keys():
 			average_head_real_actions[key] /= number_of_head_rt1
 
-		is_one_rt1_grabbing = False
-		for head_real_action in head_real_actions:
-			if head_real_action['gripper_close'] == 1.0:
-				is_one_rt1_grabbing = True
+		number_of_rt1s_grabbing = 0
+		for idx, head_real_action in enumerate(head_real_actions):
+			if head_real_action['gripper_close'] == ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED:
+				print('Head', idx, 'Wants to grab the object')
+				number_of_rt1s_grabbing += 1
 
-		# the fifth command seems to be good for grabbing stuff
-		average_real_action['gripper_close'] = head_real_actions[5]['gripper_close']
-		# we are also prioritizing the head y coordinate over the grippers
-		average_real_action['y'] = average_head_real_actions['y']
-		# we are also prioritizing the head z coordinate over the grippers
-		average_real_action['z'] = average_head_real_actions['z']
-		average_real_action['x'] = average_head_real_actions['x']
+		# if self.has_grabbed:
+		# 	average_real_action['gripper_close'] = ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED
+		# 	average_real_action['y'] = 0.0
+		# 	average_real_action['z'] = 1.0
+		# 	average_real_action['extension'] = 0.0
+		# 	return average_real_action
 
-		# we are also prioritizing the head yaw over the grippers
-		# average_real_action['yaw'] = average_head_real_actions['yaw']
 		
+		more_than_threshold_grabbing = number_of_rt1s_grabbing >= self.rt1_gripper_number_threshold
+		self.has_grabbed = more_than_threshold_grabbing
+
+		# average_real_action['gripper_close'] = average_head_real_actions['gripper_close']
+		average_real_action['gripper_close'] = ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED if more_than_threshold_grabbing else average_head_real_actions['gripper_close']
+
+		if more_than_threshold_grabbing:
+			#we want to only influence the gripper value in case we are closing it
+			print('We are grabbing the object!')
+			average_real_action['z'] = prev_lift_value
+			average_real_action['extension'] = prev_extension_value
+			average_real_action['x'] = prev_extension_value
+		else:
+			# we are also prioritizing the head y coordinate over the grippers
+			average_real_action['y'] = average_head_real_actions['y']
+			# we are also prioritizing the head z coordinate over the grippers
+			average_real_action['z'] = average_head_real_actions['z']
+			average_real_action['x'] = average_head_real_actions['x']		
 		
 		return average_real_action
+		
+
+	def carry_object(self):
+		print('sending carrry object command')
+		duration1 = Duration(seconds=10.0)
+
+		point1 = JointTrajectoryPoint()
+		positions = [
+				# map lift value to 0.2 to 1.0
+				float(1.0),
+				float(0.3), 
+				float(0.0),
+				# wrist_yaw_pos,
+				float(0.0),
+				# wrist_pitch_pos,
+				float(0.0),
+				np.pi/2,
+				0.0,
+				ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED
+				# -1.0
+				]
+		
+		joint_names = [
+					'joint_lift', 
+					'wrist_extension', 
+					'joint_wrist_yaw', 
+					'joint_wrist_pitch',
+					'joint_wrist_roll',
+					'joint_head_pan',
+					'joint_head_tilt',
+					'joint_gripper_finger_left',
+					]
+					
+		point1.positions = positions
+		
+		point1.time_from_start = duration1.to_msg()
+		trajectory_goal = FollowJointTrajectory.Goal()
+		trajectory_goal.trajectory.joint_names = joint_names
+		trajectory_goal.trajectory.points = [point1]
+		trajectory_goal.trajectory.header.stamp = self.get_clock().now().to_msg()
+		trajectory_goal.trajectory.header.frame_id = 'base_link'
+		print('sending trajectory goal')
+		self.trajectory_client.send_goal_async(trajectory_goal)
 		
 
 	def main(self):
@@ -472,16 +570,26 @@ class RT1Node(Node):
 				self.got_joint_states = False
 
 				while not self.got_head_image or not self.got_wrist_image:
-					print('----------------------------------')
-					print('state received')
-					print('got_head_image', self.got_head_image)
-					print('got_wrist_image', self.got_wrist_image)
 					rclpy.spin_once(self)
-					print('----------------------------------')
 				
 				self.step_num += 1
 				# print('image shape', self.image_state.shape)
 				images = [self.resized_image_state, self.resized_gripper_image_state]
+				gripper_image_embedding = self.get_image_embedding(self.resized_gripper_image_state)
+				print(self.average_sample_images_embedding.shape)
+				print(gripper_image_embedding.shape)
+				gripper_image_similarity = cos_sim(gripper_image_embedding[0], self.average_sample_images_embedding)
+				need_to_grasp = gripper_image_similarity > 0.7
+				REAL_ACTION_RECORD['gripper_image_similarity'].append(gripper_image_similarity.detach().numpy())
+				if gripper_image_similarity > 0.85:
+					if not self.grasped_at_step:
+						self.grasped_at_step = self.step_num
+					print('Gripper Image Similarity:', gripper_image_similarity)
+					print('Gripper Image is similar to the sample images. We are grabbing the object')
+				if self.grasped_at_step:
+					if self.step_num > self.grasped_at_step+1:
+						self.carry_object()
+
 				image_names = ['head', 'gripper']
 				action_time_str = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 				real_actions = []
@@ -493,24 +601,31 @@ class RT1Node(Node):
 					if name == 'head':
 						for i in range(self.head_rt1_num):
 							self.rt1_head_observations[i]['image'] = image
-							# we are giving each rt1 a slightly different embedding for diversity
-							self.rt1_head_observations[i]['natural_language_embedding'] = self.command_embeddings[i:i+1]
+							if self.diversify_command_embeddings:
+								# we are giving each rt1 a slightly different embedding for diversity
+								self.rt1_head_observations[i]['natural_language_embedding'] = self.command_embeddings[i:i+1]
+							else:
+								self.rt1_head_observations[i]['natural_language_embedding'] = self.average_command_embedding
+
 							tfa_time_step = ts.transition(self.rt1_head_observations[i], reward=np.zeros((), dtype=np.float32))
 							policy_step = self.rt1_head_tfa_policies[i].action(tfa_time_step, self.rt1_head_policy_states[i])
 							rt1_action = policy_step.action
 							self.rt1_head_policy_states[i] = policy_step.state
-							print('head rt1 action')
-							print(rt1_action)
 							record_rt1_actions(rt1_action, f'head{i}')
 							real_action = self.translate_rt1_action_to_real_actions(rt1_action)
 							real_actions.append(real_action)
 							rt1_actions.append(rt1_action)
+							print("Got output from head rt1:", i)
 
 					elif name == 'gripper':
 						for i in range(self.wrist_rt1_num):
 							self.rt1_wrist_observations[i]['image'] = image
 							# we are giving each rt1 a slightly different embedding for diversity
-							self.rt1_wrist_observations[i]['natural_language_embedding'] = self.command_embeddings[i:i+1]
+							if self.diversify_command_embeddings:
+								# we are giving each rt1 a slightly different embedding for diversity
+								self.rt1_head_observations[i]['natural_language_embedding'] = self.command_embeddings[i:i+1]
+							else:
+								self.rt1_head_observations[i]['natural_language_embedding'] = self.average_command_embedding
 							tfa_time_step = ts.transition(self.rt1_wrist_observations[i], reward=np.zeros((), dtype=np.float32))
 							policy_step = self.rt1_wrist_tfa_policies[i].action(tfa_time_step, self.rt1_wrist_policy_states[i])
 							rt1_action = policy_step.action
@@ -545,10 +660,6 @@ class RT1Node(Node):
 				# twist.angular.z = rotation
 				twist.linear.x = float(real_action['y'])
 				self.twist_pub.publish(twist)
-				print('---------------------------------------------------------------')
-				print('RT1 ACTION')
-				print(rt1_action)
-				print('---------------------------------------------------------------')
 
 
 				
@@ -577,12 +688,10 @@ class RT1Node(Node):
 
 				lift_height_remain = LIFT_HEIGHT - lift_value
 				angle = np.arctan2(real_action['extension'] + 0.5, lift_height_remain)
-				print("ANGLE", angle)
 				 
 
 				head_pan_pos = -np.pi/2
 				head_tilt_pos = -np.pi/2 + angle
-				print('HEAD_TILT_POS', head_tilt_pos)
 				wrist_yaw_pos = np.pi/2
 				wrist_pitch_pos = 0.0
 
@@ -605,10 +714,19 @@ class RT1Node(Node):
 				# point0.velocities = [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
 				# point0.accelerations = [1.0, 1.0, 3.5, 1.0, 1.0, 1.0, 1.0]
 				# point0.time_from_start = duration0.to_msg()
-
-				# SECOND POINT
-				point1 = JointTrajectoryPoint()
-				positions = [
+				if need_to_grasp:
+					positions = [
+						lift_value, 
+						extension_value+0.05, 
+						wrist_yaw_value, 
+						wrist_pitch_value,
+						wrist_roll_value,
+						head_pan_value, 
+						head_tilt_value,
+						ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED,
+					]
+				else:
+					positions = [
 						# map lift value to 0.2 to 1.0
 						float(real_action['z']),
 						float(real_action['extension']), 
@@ -621,7 +739,11 @@ class RT1Node(Node):
 						head_tilt_pos,
 						float(real_action['gripper_close'])
 						# -1.0
-						]
+					]
+				
+
+				# SECOND POINT
+				point1 = JointTrajectoryPoint()
 				
 				# if positions[0] < prev_positions[0]:
 				# 	# making sure it does not go down compared to previous
@@ -639,14 +761,6 @@ class RT1Node(Node):
 					'joint_head_tilt',
 					'joint_gripper_finger_left',
 					]
-				
-				
-				print('previous')
-				print(' '.join(joint_names))
-				print(' '.join(map(str, prev_positions)))
-				print('current')
-				print(' '.join(joint_names))
-				print(' '.join(map(str, positions)))
 					
 				point1.positions = positions
 				
