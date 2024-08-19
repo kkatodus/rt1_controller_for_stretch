@@ -32,7 +32,7 @@ import json
 import torch
 from transformers import ViTImageProcessor, ViTModel
 from PIL import Image as PILImage
-
+import logging
 
 
 #fix seeds
@@ -92,6 +92,7 @@ COMMANDS = commands[COMMAND_TYPE]
 # COMMAND = "Open the cupboard door"
 WHEEL_SEPARATION = 0.3153
 WHEEL_DIAMETER = 0.1016
+GRIPPER_GRASP_THRESHOLD = 0.75
 
 joints = ['wrist_extension', 'joint_lift', 'joint_arm_l3', 'joint_arm_l2', 'joint_arm_l1', 'joint_arm_l0', 'joint_head_pan', 'joint_head_tilt', 'joint_wrist_yaw', 'joint_wrist_pitch', 'joint_wrist_roll', 'joint_gripper_finger_left', 'joint_gripper_finger_right']
 
@@ -113,6 +114,9 @@ OUTPUT_DIR_FOR_RUN = os.path.join(OUTPUT_DIR, datetime.now().strftime('%Y-%m-%d_
 os.makedirs(OUTPUT_DIR_FOR_RUN)
 pic_dir = os.path.join(OUTPUT_DIR_FOR_RUN, 'pics')
 os.makedirs(pic_dir)
+logger = logging.getLogger(__name__)
+logging.basicConfig(filename=os.path.join(OUTPUT_DIR_FOR_RUN, 'run.log'), level=logging.INFO)
+logger.info(f'Starting logging for run {datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
 
 RT1_LOWER_LIMIT = -1.0
 RT1_UPPER_LIMIT = 1.0
@@ -316,6 +320,7 @@ class RT1Node(Node):
 		self.wrist_rt1_num = 0
 		self.rt1_gripper_number_threshold = 1
 		self.has_grabbed = False
+		self.release_command = False
 
 		self.rt1_head_tfa_policies = []
 		self.rt1_head_observations = []
@@ -486,15 +491,8 @@ class RT1Node(Node):
 		for idx, head_real_action in enumerate(head_real_actions):
 			if head_real_action['gripper_close'] == ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED:
 				print('Head', idx, 'Wants to grab the object')
+				logger.info(f'Head {idx} wants to grab the object')
 				number_of_rt1s_grabbing += 1
-
-		# if self.has_grabbed:
-		# 	average_real_action['gripper_close'] = ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED
-		# 	average_real_action['y'] = 0.0
-		# 	average_real_action['z'] = 1.0
-		# 	average_real_action['extension'] = 0.0
-		# 	return average_real_action
-
 		
 		more_than_threshold_grabbing = number_of_rt1s_grabbing >= self.rt1_gripper_number_threshold
 		self.has_grabbed = more_than_threshold_grabbing
@@ -504,6 +502,9 @@ class RT1Node(Node):
 
 		if more_than_threshold_grabbing:
 			#we want to only influence the gripper value in case we are closing it
+			if not self.grasped_at_step:
+				self.grasped_at_step = self.step_num
+			logger.info("Grasping due as RT1s think we should grasp it")
 			print('We are grabbing the object!')
 			average_real_action['z'] = prev_lift_value
 			average_real_action['extension'] = prev_extension_value
@@ -520,6 +521,7 @@ class RT1Node(Node):
 
 	def carry_object(self):
 		print('sending carrry object command')
+		logger.info('carrying object')
 		duration1 = Duration(seconds=10.0)
 
 		point1 = JointTrajectoryPoint()
@@ -532,7 +534,7 @@ class RT1Node(Node):
 				float(0.0),
 				# wrist_pitch_pos,
 				float(0.0),
-				np.pi/2,
+				-np.pi/2,
 				0.0,
 				ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED
 				# -1.0
@@ -559,36 +561,123 @@ class RT1Node(Node):
 		trajectory_goal.trajectory.header.frame_id = 'base_link'
 		print('sending trajectory goal')
 		self.trajectory_client.send_goal_async(trajectory_goal)
+
+	def move_cam_and_arm_to_init_pos(self):
+		head_tilt_idx = self.joint_state.name.index('joint_head_tilt')
+
+		head_tilt_value = self.joint_state.position[head_tilt_idx]
+		logger.info('Moving wrist to init pos')
+		duration1 = Duration(seconds=10.0)
+
+		point1 = JointTrajectoryPoint()
+		positions = [
+				# map lift value to 0.2 to 1.0
+				float(0.8),
+				float(0.0), 
+				float(0.0),
+				# wrist_yaw_pos,
+				float(0.0),
+				# wrist_pitch_pos,
+				float(0.0),
+				-np.pi/2,
+				float(-0.52),
+				ACTUATOR_GRIPPER_UPPER_LIMIT_OPEN
+				# -1.0
+				]
 		
+		joint_names = [
+					'joint_lift', 
+					'wrist_extension', 
+					'joint_wrist_yaw', 
+					'joint_wrist_pitch',
+					'joint_wrist_roll',
+					'joint_head_pan',
+					'joint_head_tilt',
+					'joint_gripper_finger_left',
+					]
+					
+		point1.positions = positions
+		
+		point1.time_from_start = duration1.to_msg()
+		trajectory_goal = FollowJointTrajectory.Goal()
+		trajectory_goal.trajectory.joint_names = joint_names
+		trajectory_goal.trajectory.points = [point1]
+		trajectory_goal.trajectory.header.stamp = self.get_clock().now().to_msg()
+		trajectory_goal.trajectory.header.frame_id = 'base_link'
+		print('sending trajectory goal')
+		self.trajectory_client.send_goal_async(trajectory_goal)
+
+	def release_object(self):
+
+		logger.info('Releasing object')
+		duration1 = Duration(seconds=10.0)
+
+		point1 = JointTrajectoryPoint()
+		positions = [
+				ACTUATOR_GRIPPER_UPPER_LIMIT_OPEN
+				]
+		
+		joint_names = [
+					'joint_gripper_finger_left',
+					]
+					
+		point1.positions = positions
+		
+		point1.time_from_start = duration1.to_msg()
+		trajectory_goal = FollowJointTrajectory.Goal()
+		trajectory_goal.trajectory.joint_names = joint_names
+		trajectory_goal.trajectory.points = [point1]
+		trajectory_goal.trajectory.header.stamp = self.get_clock().now().to_msg()
+		trajectory_goal.trajectory.header.frame_id = 'base_link'
+		print('sending trajectory goal')
+		self.trajectory_client.send_goal_async(trajectory_goal)
+		self.release_command = False
+		logger.info('Release completed')
 
 	def main(self):
 		self.record_configs_for_run()
 		while True:
 			try:
+					
 				self.got_head_image = False
 				self.got_wrist_image = False
 				self.got_joint_states = False
 
-				while not self.got_head_image or not self.got_wrist_image:
+				while not self.got_head_image or not self.got_wrist_image or not self.got_joint_states:
 					rclpy.spin_once(self)
+
+				if self.step_num == 0:
+					self.move_cam_and_arm_to_init_pos()
+					self.step_num += 1
+					continue
 				
 				self.step_num += 1
+				logger.info(f'Step num:{self.step_num}  Grasped at: Timestep {self.grasped_at_step}')
 				# print('image shape', self.image_state.shape)
 				images = [self.resized_image_state, self.resized_gripper_image_state]
 				gripper_image_embedding = self.get_image_embedding(self.resized_gripper_image_state)
 				print(self.average_sample_images_embedding.shape)
 				print(gripper_image_embedding.shape)
 				gripper_image_similarity = cos_sim(gripper_image_embedding[0], self.average_sample_images_embedding)
-				need_to_grasp = gripper_image_similarity > 0.7
+				need_to_grasp = gripper_image_similarity > GRIPPER_GRASP_THRESHOLD
 				REAL_ACTION_RECORD['gripper_image_similarity'].append(gripper_image_similarity.detach().numpy())
-				if gripper_image_similarity > 0.85:
+				logger.info(f'Gripper image similarity:{gripper_image_similarity}')
+
+				if gripper_image_similarity > GRIPPER_GRASP_THRESHOLD:
 					if not self.grasped_at_step:
 						self.grasped_at_step = self.step_num
+						logger.info(f'Grasping at timestep {self.grasped_at_step} due to consine sim')
 					print('Gripper Image Similarity:', gripper_image_similarity)
 					print('Gripper Image is similar to the sample images. We are grabbing the object')
 				if self.grasped_at_step:
 					if self.step_num > self.grasped_at_step+1:
-						self.carry_object()
+						release = input('We are carrying the object, do you want to release it?(yes/no)')
+						if release == 'yes':
+							self.grasped_at_step = None
+							self.release_object()
+						else:
+							self.carry_object()
+						continue
 
 				image_names = ['head', 'gripper']
 				action_time_str = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -715,6 +804,7 @@ class RT1Node(Node):
 				# point0.accelerations = [1.0, 1.0, 3.5, 1.0, 1.0, 1.0, 1.0]
 				# point0.time_from_start = duration0.to_msg()
 				if need_to_grasp:
+					logger.info('Need to grasp triggered')
 					positions = [
 						lift_value, 
 						extension_value+0.05, 
