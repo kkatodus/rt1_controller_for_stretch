@@ -5,7 +5,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 import time
-from geometry_msgs.msg import PointStamped, PoseStamped, Twist
+from geometry_msgs.msg import PointStamped, Twist
 
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import JointState
@@ -38,10 +38,8 @@ import logging
 #fix seeds
 np.random.seed(0)
 tf.random.set_seed(0)
-
-
-
-
+# these are commands that are embedded to be fed into the RT1s
+# the embedded commands can be averaged or different embeddings can be fed into different RT1s
 commands = {
 	'coke':[
 		"Pick up the coke can on the table",
@@ -84,30 +82,22 @@ commands = {
 	]
 }
 
-#COMMAND TYPES
-#1. pick up coke
-#2. cupboard
+# command type determines which set of embeddings we will use for the RT1s
 COMMAND_TYPE = 'coke'
 COMMANDS = commands[COMMAND_TYPE]
-# COMMAND = "Open the cupboard door"
+
 WHEEL_SEPARATION = 0.3153
 WHEEL_DIAMETER = 0.1016
+# this is the threshold for the cosine similarity between the gripper image and the sample images to decide if we should grasp the object
 GRIPPER_GRASP_THRESHOLD = 0.75
 
+# joint names that are understood by the stretch robot
 joints = ['wrist_extension', 'joint_lift', 'joint_arm_l3', 'joint_arm_l2', 'joint_arm_l1', 'joint_arm_l0', 'joint_head_pan', 'joint_head_tilt', 'joint_wrist_yaw', 'joint_wrist_pitch', 'joint_wrist_roll', 'joint_gripper_finger_left', 'joint_gripper_finger_right']
 
-joint_limits = {
-	'wrist_extension':[0, 1],
-	'joint_lift':[0, 0.8],
-	'joint_head_pan':[-4.04, 1.73],
-	'joint_head_tilt':[-1.53, 0.79],
-	'joint_wrist_yaw':[-1.39, 4.42],
-	'joint_wrist_pitch':[-1.57, 0.56],
-	'joint_wrist_roll':[-3.14, 3.14],
-}
-
+# this is something we need to convert the image message coming through ros2 to numpy array
 bridge = CvBridge()
 
+# definition of output directories and the logger
 OUTPUT_DIR = '../output'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 OUTPUT_DIR_FOR_RUN = os.path.join(OUTPUT_DIR, datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
@@ -118,11 +108,14 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(filename=os.path.join(OUTPUT_DIR_FOR_RUN, 'run.log'), level=logging.INFO)
 logger.info(f'Starting logging for run {datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
 
+# RT1 generally outputs a float between -1 and 1
 RT1_LOWER_LIMIT = -1.0
 RT1_UPPER_LIMIT = 1.0
 
+# Gripper limits of the RT1 action output
 RT1_GRIPPER_UPPER_LIMIT_CLOSED = 1.0
 RT1_GRIPPER_LOWER_LIMIT_OPEN = -1.0
+# Gripper limits of the real action output
 ACTUATOR_GRIPPER_UPPER_LIMIT_OPEN = 1.0
 ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED = 0.0
 
@@ -131,9 +124,11 @@ ACTUATOR_LIFT_UPPER_LIMIT = 1.2
 
 LIFT_HEIGHT = 1.2
 
+# a dictionary to record all the actions of the RT1s
 RT1_ACTION_RECORD = {
 }
 
+# a dictionary to record the actions that are actually sent to the robot
 REAL_ACTION_RECORD = {
 	'x':[],
 	'y':[],
@@ -146,12 +141,14 @@ REAL_ACTION_RECORD = {
 	'gripper_close':[],
 	'is_terminal_episode':[],
 	'gripper_image_similarity':[]
-
 }
 
 def plot_rt1_actions():
+	"""
+	Plotting the rt1 the output of the multiple RT1s and
+	"""
 	print('saving rt1 actions')
-	fig, ax = plt.subplots(len(RT1_ACTION_RECORD['head0']), figsize=(20, 50))
+	_, ax = plt.subplots(len(RT1_ACTION_RECORD['head0']), figsize=(20, 50))
 	for idx, (key, value) in enumerate(RT1_ACTION_RECORD['head0'].items()):
 		ax[idx].plot(value)
 		for size, (camera_key, value) in enumerate(RT1_ACTION_RECORD.items()):
@@ -167,6 +164,9 @@ def plot_rt1_actions():
 	plt.close()
 
 def plot_real_actions():
+	"""
+	Real actions are actions that are actually sent to the robot.aka after the mapping from the rt1 action to real actions
+	"""
 	print('saving real actions')
 	fig, ax = plt.subplots(len(list(REAL_ACTION_RECORD.keys())), figsize=(20, 50))
 	for idx, (key, value) in enumerate(REAL_ACTION_RECORD.items()):
@@ -179,9 +179,19 @@ def plot_real_actions():
 	plt.close()
 
 def cos_sim(vec1, vec2):
+	"""
+	:param vec1: vector 1
+	:param vec2: vector 2
+	:return: cosine similarity between vec1 and vec2
+	"""
 	return (vec1@vec2)/(torch.norm(vec1)*torch.norm(vec2))
 
 def record_real_actions(real_action):
+	"""
+	:param real_action: a dictionary of the real action that is sent to the robot
+
+	A function to record the real actions that are sent to the robot
+	"""
 	REAL_ACTION_RECORD['x'].append(real_action['x'])
 	REAL_ACTION_RECORD['y'].append(real_action['y'])
 	REAL_ACTION_RECORD['z'].append(real_action['z'])
@@ -194,11 +204,12 @@ def record_real_actions(real_action):
 	REAL_ACTION_RECORD['is_terminal_episode'].append(real_action['is_terminal_episode'])
 
 def record_rt1_actions(rt1_action, camera='head'):
-	base_displacement_vector = rt1_action['base_displacement_vector']
-	base_displacement_vector_x = base_displacement_vector[0]
-	base_displacement_vector_y = base_displacement_vector[1]
-	omega = np.arctan2(base_displacement_vector_y, base_displacement_vector_x)
+	"""
+	:param rt1_action: a dictionary of the rt1 action that is sent to the robot
+	:param camera: the camera that the rt1 action is coming from
 
+	A function to record the rt1 actions coming from each RT1
+	"""
 	base_rotation = rt1_action['base_displacement_vertical_rotation']
 	gripper_closedness = rt1_action['gripper_closedness_action'][0]
 	rotation_delta = rt1_action['rotation_delta']
@@ -213,7 +224,6 @@ def record_rt1_actions(rt1_action, camera='head'):
 	world_vector_z = world_vector[2]
 
 	world_vector_r = np.sqrt(world_vector_x**2 + world_vector_y**2)
-	world_vector_theta = np.arctan2(world_vector_y, world_vector_x) + np.pi/2
 	if camera not in RT1_ACTION_RECORD.keys():
 		RT1_ACTION_RECORD[camera] = {
 			'world_vector_x':[],
@@ -239,20 +249,6 @@ def record_rt1_actions(rt1_action, camera='head'):
 	RT1_ACTION_RECORD[camera]['base_rotation'].append(base_rotation)
 	RT1_ACTION_RECORD[camera]['terminate_episode'].append(terminate_episode)
 
-def mix_rt1_action_outputs_from_multiple_inputs(rt1_actions):
-	number_of_rt1_actions = len(rt1_actions)
-	mixed_rt1_actions = {}
-	for rt1_action in rt1_actions:
-		for key, val in rt1_action.items():
-			if key not in mixed_rt1_actions:
-				mixed_rt1_actions[key] = val
-			else:
-				mixed_rt1_actions[key] += val
-	for key in mixed_rt1_actions.keys():
-		mixed_rt1_actions[key] = mixed_rt1_actions[key] / number_of_rt1_actions
-	return mixed_rt1_actions
-		
-
 class RT1Node(Node):
 	def __init__(self):
 		super().__init__('rt1_controller')
@@ -263,7 +259,6 @@ class RT1Node(Node):
 		self.got_wrist_image = False
 		self.got_joint_states = False
 
-
 		print('Connecting to action server')
 
 		#joint trajectory client
@@ -272,19 +267,16 @@ class RT1Node(Node):
 		if not server_reached:
 			self.get_logger().error('Unable to connect to arm action server. Timeout exceeded.')
 			sys.exit()
+		# subscriber to get the joint states of the robot
 		self.joint_subscription = self.create_subscription(JointState, '/stretch/joint_states', self.joint_states_callback, 1)
 
-		# subscribers
-		self.sound_direction_sub = self.create_subscription(Int32, "/sound_direction", self.callback_direction, 1)
+		# subscriber to get the images from the cameras
 		self.gripper_image_sub = self.create_subscription(Image, '/gripper_camera/color/image_rect_raw', self.wrist_image_callback, 1)
 		self.image_sub = self.create_subscription(Image, '/camera/color/image_raw', self.image_callback, 1)
-		self.target_point_publisher = self.create_publisher(PointStamped, "/clicked_point", 1)
-		# cmd vel publisher
+
+		# publisher to move the base of the robot
 		self.twist_pub = self.create_publisher(Twist, '/stretch/cmd_vel', 1)
 		
-		self.trajectory_client = ActionClient(self, FollowJointTrajectory, '/stretch_controller/follow_joint_trajectory')
-
-
 		# states
 		self.joint_state = JointState()
 		self.image_state = None
@@ -292,6 +284,7 @@ class RT1Node(Node):
 		self.gripper_image_state = None
 		self.resized_gripper_image_state = None
 
+		# initializing the universal sentence encoder
 		self.universal_sentence_encoder = hub.load('../universal')
 		print("INITIALIZED SENTENCE ENCODER")
 		self.command_embeddings = self.universal_sentence_encoder(COMMANDS)
@@ -299,9 +292,10 @@ class RT1Node(Node):
 		self.average_command_embedding = np.expand_dims(average_command_embedding, axis=0)
 		self.diversify_command_embeddings = True
 
-		
+		# initializing the image encoder
 		self.image_processor = ViTImageProcessor.from_pretrained('google/vit-base-patch16-224-in21k')
 		self.image_encoder = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
+		# getting the sample image embeddings for the gripper
 		gripper_sample_images_dir = '../grabbing_samples'
 		sample_image_filenames = os.listdir(gripper_sample_images_dir)
 		paths = [os.path.join(gripper_sample_images_dir, filename) for filename in sample_image_filenames]
@@ -311,13 +305,13 @@ class RT1Node(Node):
 		last_hidden_states = outputs.last_hidden_state
 		print(last_hidden_states.shape)
 		self.average_sample_images_embedding = torch.mean(torch.mean(last_hidden_states, dim=1), dim=0)
-
 		print("INITIALIZED IMAGE ENCODER")
 
-
+		# initializing the RT1s, you can specify how many you want to create for the head and the wrist
 		model_path = '../rt_1_x_tf_trained_for_002272480_step'
 		self.head_rt1_num = 7
 		self.wrist_rt1_num = 0
+		# if more than this number of RT1 thinks that we should grasp the object, the grasping command is triggered
 		self.rt1_gripper_number_threshold = 1
 		self.has_grabbed = False
 		self.release_command = False
@@ -356,6 +350,7 @@ class RT1Node(Node):
 			self.rt1_wrist_observations.append(tf_agents.specs.zero_spec_nest(tf_agents.specs.from_spec(tfa_policy.time_step_spec.observation)))
 			print(f'INITIALIZED RT1 WRIST {i}')
 		
+		# after initializing all the RT1s, we wait for the user to confirm that we can continue with the task
 		continue_task = False
 		while not continue_task:
 			answer = input('All RT1s are initialized. Should we continue with the task?(yes/no)')
@@ -363,6 +358,9 @@ class RT1Node(Node):
 				continue_task = True
 			time.sleep(2)
 	def record_configs_for_run(self):
+		"""
+		A function to record the configurations of the run
+		"""
 		data = {
 			'mixing_multiple_inputs':'Now we are always mixing multiple inputs',
 			'head_rt1_num':self.head_rt1_num,
@@ -375,40 +373,13 @@ class RT1Node(Node):
 
 
 	def translate_rt1_action_to_real_actions(self, rt1_action):
-		head_pan_idx = self.joint_state.name.index('joint_head_pan')
-		head_tilt_idx = self.joint_state.name.index('joint_head_tilt')
-		wrist_yaw_idx = self.joint_state.name.index('joint_wrist_yaw')
-		wrist_pitch_idx = self.joint_state.name.index('joint_wrist_pitch')
-		wrist_roll_idx = self.joint_state.name.index('joint_wrist_roll')
-		gripper_left_idx = self.joint_state.name.index('joint_gripper_finger_left')
-		gripper_right_idx = self.joint_state.name.index('joint_gripper_finger_right')
-		lift_idx = self.joint_state.name.index('joint_lift')
-		extension_idx = self.joint_state.name.index('wrist_extension')
+		"""
+		:param rt1_action: a dictionary of the rt1 action that is sent to the robot
+		:return: a dictionary of the real action that is sent to the robot
 
-		prev_head_pan_value = self.joint_state.position[head_pan_idx]
-		prev_head_tilt_value = self.joint_state.position[head_tilt_idx]
-		prev_wrist_yaw_value = self.joint_state.position[wrist_yaw_idx]
-		prev_wrist_pitch_value = self.joint_state.position[wrist_pitch_idx]
-		prev_wrist_roll_value = self.joint_state.position[wrist_roll_idx]
-		prev_gripper_left_value = self.joint_state.position[gripper_left_idx]
-		prev_gripper_right_value = self.joint_state.position[gripper_right_idx]
-		prev_lift_value = self.joint_state.position[lift_idx]
-		prev_extension_value = self.joint_state.position[extension_idx]
-		# RT1 outputs decomposed
-		base_displacement_vector = rt1_action['base_displacement_vector']
-		base_displacement_vector_x = base_displacement_vector[0]
-		base_displacement_vector_y = base_displacement_vector[1]
-		omega = np.arctan2(base_displacement_vector_y, base_displacement_vector_x)
-
-
-		base_rotation = rt1_action['base_displacement_vertical_rotation']
+		This is a key function that translates the RT1 action to the real action that is sent to the robot. We do some linear mapping of the outputs to convert the RT1 actions to the real actions to be used by stretch
+		"""
 		gripper_closedness = rt1_action['gripper_closedness_action'][0]
-		rotation_delta = rt1_action['rotation_delta']
-		rt1_roll = rotation_delta[0]
-		rt1_pitch = rotation_delta[1]
-		rt1_yaw = rotation_delta[2]
-
-
 		terminate_episode = rt1_action['terminate_episode']
 		is_terminal_episode = terminate_episode[0]
 		world_vector = rt1_action['world_vector']
@@ -436,36 +407,33 @@ class RT1Node(Node):
 		}
 	
 	def get_image_embedding(self, image):
+		"""
+		:param image: a numpy array of the image
+		:return: the embedding of the image
+
+		This uses the Vision Transformer to get the embedding of the image
+		"""
 		inputs = self.image_processor(image, return_tensors='pt')
 		outputs = self.image_encoder(**inputs)
 		last_hidden_states = outputs.last_hidden_state
 		return torch.mean(last_hidden_states, dim=1)
 
 	def average_real_action_outputs_from_multiple_inputs(self, real_actions):
-		head_pan_idx = self.joint_state.name.index('joint_head_pan')
-		head_tilt_idx = self.joint_state.name.index('joint_head_tilt')
-		wrist_yaw_idx = self.joint_state.name.index('joint_wrist_yaw')
-		wrist_pitch_idx = self.joint_state.name.index('joint_wrist_pitch')
-		wrist_roll_idx = self.joint_state.name.index('joint_wrist_roll')
-		gripper_left_idx = self.joint_state.name.index('joint_gripper_finger_left')
-		gripper_right_idx = self.joint_state.name.index('joint_gripper_finger_right')
+		"""
+		:param real_actions: a list of dictionaries of the real actions that are sent to the robot
+		:return: a dictionary of the average real action that is sent to the robot
+		
+		As we are using multiple instances of RT1 each producting their own RT1 action that is converted to the real action, we are averaging the real actions to get the final real action that is sent to the robot
+		"""
 		lift_idx = self.joint_state.name.index('joint_lift')
 		extension_idx = self.joint_state.name.index('wrist_extension')
 
-		prev_head_pan_value = self.joint_state.position[head_pan_idx]
-		prev_head_tilt_value = self.joint_state.position[head_tilt_idx]
-		prev_wrist_yaw_value = self.joint_state.position[wrist_yaw_idx]
-		prev_wrist_pitch_value = self.joint_state.position[wrist_pitch_idx]
-		prev_wrist_roll_value = self.joint_state.position[wrist_roll_idx]
-		prev_gripper_left_value = self.joint_state.position[gripper_left_idx]
-		prev_gripper_right_value = self.joint_state.position[gripper_right_idx]
 		prev_lift_value = self.joint_state.position[lift_idx]
 		prev_extension_value = self.joint_state.position[extension_idx]
 
 		number_of_real_actions = len(real_actions)
 		number_of_head_rt1 = self.head_rt1_num
 		head_real_actions = real_actions[:number_of_head_rt1]
-		gripper_real_actions = real_actions[number_of_head_rt1:]
 
 		average_real_action = {}
 		for real_action in real_actions:
@@ -487,6 +455,7 @@ class RT1Node(Node):
 		for key in average_head_real_actions.keys():
 			average_head_real_actions[key] /= number_of_head_rt1
 
+		# counting the number of RT1s that are grabbing the object
 		number_of_rt1s_grabbing = 0
 		for idx, head_real_action in enumerate(head_real_actions):
 			if head_real_action['gripper_close'] == ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED:
@@ -494,10 +463,10 @@ class RT1Node(Node):
 				logger.info(f'Head {idx} wants to grab the object')
 				number_of_rt1s_grabbing += 1
 		
+		# if more than the threshold number of RT1s are grabbing the object, we are grabbing the object
 		more_than_threshold_grabbing = number_of_rt1s_grabbing >= self.rt1_gripper_number_threshold
 		self.has_grabbed = more_than_threshold_grabbing
 
-		# average_real_action['gripper_close'] = average_head_real_actions['gripper_close']
 		average_real_action['gripper_close'] = ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED if more_than_threshold_grabbing else average_head_real_actions['gripper_close']
 
 		if more_than_threshold_grabbing:
@@ -520,6 +489,9 @@ class RT1Node(Node):
 		
 
 	def carry_object(self):
+		"""
+		This is a command that is being sent to the robot once the target object was grabbed
+		"""
 		print('sending carrry object command')
 		logger.info('carrying object')
 		duration1 = Duration(seconds=10.0)
@@ -563,9 +535,9 @@ class RT1Node(Node):
 		self.trajectory_client.send_goal_async(trajectory_goal)
 
 	def move_cam_and_arm_to_init_pos(self):
-		head_tilt_idx = self.joint_state.name.index('joint_head_tilt')
-
-		head_tilt_value = self.joint_state.position[head_tilt_idx]
+		"""
+		This is a command that is being sent to the robot in the first step to move the wrist and the head to the initial position
+		"""
 		logger.info('Moving wrist to init pos')
 		duration1 = Duration(seconds=10.0)
 
@@ -608,6 +580,9 @@ class RT1Node(Node):
 		self.trajectory_client.send_goal_async(trajectory_goal)
 
 	def release_object(self):
+		"""
+		This is a command that is being sent to the robot to release the object
+		"""
 
 		logger.info('Releasing object')
 		duration1 = Duration(seconds=10.0)
@@ -635,6 +610,9 @@ class RT1Node(Node):
 		logger.info('Release completed')
 
 	def main(self):
+		"""
+		The main function that is running the RT1 controller
+		"""
 		self.record_configs_for_run()
 		while True:
 			try:
@@ -643,9 +621,11 @@ class RT1Node(Node):
 				self.got_wrist_image = False
 				self.got_joint_states = False
 
+				# waiting until we have all the images and states we need 
 				while not self.got_head_image or not self.got_wrist_image or not self.got_joint_states:
 					rclpy.spin_once(self)
 
+				# when its the initial step, we are moving the arm and the head camera to the initial position
 				if self.step_num == 0:
 					self.move_cam_and_arm_to_init_pos()
 					self.step_num += 1
@@ -653,12 +633,11 @@ class RT1Node(Node):
 				
 				self.step_num += 1
 				logger.info(f'Step num:{self.step_num}  Grasped at: Timestep {self.grasped_at_step}')
-				# print('image shape', self.image_state.shape)
 				images = [self.resized_image_state, self.resized_gripper_image_state]
+				# getting the embedding of the gripper image
 				gripper_image_embedding = self.get_image_embedding(self.resized_gripper_image_state)
-				print(self.average_sample_images_embedding.shape)
-				print(gripper_image_embedding.shape)
 				gripper_image_similarity = cos_sim(gripper_image_embedding[0], self.average_sample_images_embedding)
+				# deciding if we need to grasp the object based on the cosine similarity of the gripper image with the sample images
 				need_to_grasp = gripper_image_similarity > GRIPPER_GRASP_THRESHOLD
 				REAL_ACTION_RECORD['gripper_image_similarity'].append(gripper_image_similarity.detach().numpy())
 				logger.info(f'Gripper image similarity:{gripper_image_similarity}')
@@ -670,6 +649,7 @@ class RT1Node(Node):
 					print('Gripper Image Similarity:', gripper_image_similarity)
 					print('Gripper Image is similar to the sample images. We are grabbing the object')
 				if self.grasped_at_step:
+					# if we have grasped the object in the past step, we can decide whether we want to release the object or if we want to carry it
 					if self.step_num > self.grasped_at_step+1:
 						release = input('We are carrying the object, do you want to release it?(yes/no)')
 						if release == 'yes':
@@ -688,6 +668,7 @@ class RT1Node(Node):
 					# save picture 
 					cv2.imwrite(os.path.join(pic_dir, f'{action_time_str}_{name}.png'), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
 					if name == 'head':
+						# iterating through the head RT1s
 						for i in range(self.head_rt1_num):
 							self.rt1_head_observations[i]['image'] = image
 							if self.diversify_command_embeddings:
@@ -707,6 +688,7 @@ class RT1Node(Node):
 							print("Got output from head rt1:", i)
 
 					elif name == 'gripper':
+						# iterating through the wrist RT1s
 						for i in range(self.wrist_rt1_num):
 							self.rt1_wrist_observations[i]['image'] = image
 							# we are giving each rt1 a slightly different embedding for diversity
@@ -727,12 +709,11 @@ class RT1Node(Node):
 					else:
 						raise ValueError('Unknown image name')
 					
-						
-					# mixed_rt1_action = mix_rt1_action_outputs_from_multiple_inputs(rt1_actions)
-					# record_rt1_actions(mixed_rt1_action)
-					real_action = self.average_real_action_outputs_from_multiple_inputs(real_actions)
-					record_real_actions(real_action)
+				# averaging all the real actions obtained from the RT1s
+				real_action = self.average_real_action_outputs_from_multiple_inputs(real_actions)
+				record_real_actions(real_action)
 
+				# if RT1 outputs the terminal episode signal, meaning it thinkgs that the task is done, we are plotting the actions and shutting down the node
 				is_terminal_episode = real_action['is_terminal_episode']
 				if is_terminal_episode == 1.0:
 					plot_real_actions()
@@ -742,17 +723,12 @@ class RT1Node(Node):
 					self.destroy_node()
 					rclpy.shutdown()
 					break
-				# rotation = real_action['theta']
 
 				# publishing rotation
 				twist = Twist() 
-				# twist.angular.z = rotation
 				twist.linear.x = float(real_action['y'])
 				self.twist_pub.publish(twist)
 
-
-				
-				# duration0 = Duration(seconds=0.0)
 				duration1 = Duration(seconds=10.0)
 
 				head_pan_idx = self.joint_state.name.index('joint_head_pan')
@@ -760,8 +736,6 @@ class RT1Node(Node):
 				wrist_yaw_idx = self.joint_state.name.index('joint_wrist_yaw')
 				wrist_pitch_idx = self.joint_state.name.index('joint_wrist_pitch')
 				wrist_roll_idx = self.joint_state.name.index('joint_wrist_roll')
-				gripper_left_idx = self.joint_state.name.index('joint_gripper_finger_left')
-				gripper_right_idx = self.joint_state.name.index('joint_gripper_finger_right')
 				lift_idx = self.joint_state.name.index('joint_lift')
 				extension_idx = self.joint_state.name.index('wrist_extension')
 
@@ -770,8 +744,6 @@ class RT1Node(Node):
 				wrist_yaw_value = self.joint_state.position[wrist_yaw_idx]
 				wrist_pitch_value = self.joint_state.position[wrist_pitch_idx]
 				wrist_roll_value = self.joint_state.position[wrist_roll_idx]
-				gripper_left_value = self.joint_state.position[gripper_left_idx]
-				gripper_right_value = self.joint_state.position[gripper_right_idx]
 				lift_value = self.joint_state.position[lift_idx]
 				extension_value = self.joint_state.position[extension_idx]
 
@@ -781,28 +753,8 @@ class RT1Node(Node):
 
 				head_pan_pos = -np.pi/2
 				head_tilt_pos = -np.pi/2 + angle
-				wrist_yaw_pos = np.pi/2
-				wrist_pitch_pos = 0.0
 
-				# FIRST POINT
-				# point0 = JointTrajectoryPoint()
-				prev_positions = [
-						lift_value, 
-						extension_value, 
-						wrist_yaw_value, 
-						wrist_pitch_value,
-						wrist_roll_value,
-						head_pan_value, 
-						head_tilt_value,
-						gripper_left_value,
-					]
-				
-
-				# point0.positions = prev_positions
-				
-				# point0.velocities = [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
-				# point0.accelerations = [1.0, 1.0, 3.5, 1.0, 1.0, 1.0, 1.0]
-				# point0.time_from_start = duration0.to_msg()
+				# if we are grasping the object, we are maintaining most of the values but changing the grasping value to closing value
 				if need_to_grasp:
 					logger.info('Need to grasp triggered')
 					positions = [
@@ -815,6 +767,7 @@ class RT1Node(Node):
 						head_tilt_value,
 						ACTUATOR_GRIPPER_LOWER_LIMIT_CLOSED,
 					]
+				# if we are not grasping the object, we are using the values from the RT1s
 				else:
 					positions = [
 						# map lift value to 0.2 to 1.0
@@ -832,15 +785,8 @@ class RT1Node(Node):
 					]
 				
 
-				# SECOND POINT
 				point1 = JointTrajectoryPoint()
 				
-				# if positions[0] < prev_positions[0]:
-				# 	# making sure it does not go down compared to previous
-				# 	positions[0] = prev_positions[0]
-				
-				# if positions[0] < 0.58:
-				# 	positions[0] = lift_value
 				joint_names = [
 					'joint_lift', 
 					'wrist_extension', 
@@ -872,13 +818,12 @@ class RT1Node(Node):
 				rclpy.shutdown()
 				break
 
-	def callback_speech(self, msg):
-		pass
-
-	def callback_direction(self, msg):
-		pass
-
 	def image_callback(self, msg):
+		"""
+		:param msg: the image message coming from the camera
+
+		Everytime we receive a new image message from the robot, this command is triggered and stores the image in the image_state variable
+		"""
 		print('image received')
 		cv_image = bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 		np_image = np.rot90(np.array(cv_image), k=3) 
@@ -892,6 +837,11 @@ class RT1Node(Node):
 		self.got_head_image = True
 
 	def wrist_image_callback(self, msg):
+		"""
+		:param msg: the image message coming from the camera
+
+		Everytime we receive a new wrist image message from the robot, this command is triggered and stores the image in the image_state variable
+		"""
 		print('wrist image received')
 		cv_image = bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 		np_image = np.array(cv_image)
@@ -904,11 +854,15 @@ class RT1Node(Node):
 		self.got_wrist_image = True
 
 	def joint_states_callback(self, joint_state):
+		"""
+		:param joint_state: the joint state message coming from the robot
+
+		Everytime we receive a new joint state message from the robot, this command is triggered and stores the joint state in the joint_state variable
+		"""
 		print('joint_state received')
 		self.joint_state = joint_state
 		self.got_joint_states = True
 
-		print('--------------------------------------------------------------')
 	
 	def get_logger(self):
 		return super().get_logger()
@@ -923,7 +877,6 @@ def main(args=None):
 	try:
 
 		# wait for joint state and image to come in
-
 		while node.image_state is None:
 			print('waiting for image')
 			rclpy.spin_once(node)
@@ -933,7 +886,6 @@ def main(args=None):
 			rclpy.spin_once(node)
 			print('spun once')
 
-		# node.issue_multipoint_command()
 		node.main()
 
 		node.destroy_node()
